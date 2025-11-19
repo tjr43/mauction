@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>실시간 경매 드래프트 (중복방지+룰렛)</title>
+    <title>실시간 경매 드래프트 (중복방지 강화)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     
     <!-- Firebase SDK -->
@@ -86,7 +86,11 @@
                     </div>
                 </div>
                 <div class="grid grid-cols-3 gap-2">
-                    <div><label class="text-xs text-gray-400 block">시작 포인트</label><input type="number" id="start-point-input" value="1000" class="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-white text-sm"></div>
+                    <div>
+                        <label class="text-xs text-gray-400 block">시작 포인트</label>
+                        <!-- [수정] 숫자만 입력 가능하도록 oninput 추가 -->
+                        <input type="number" id="start-point-input" value="1000" oninput="this.value = this.value.replace(/[^0-9]/g, '');" class="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-white text-sm">
+                    </div>
                     <div><label class="text-xs text-purple-400 block">Team A 이름/감독</label><div class="flex gap-1"><input id="input-team-a-name" placeholder="팀명" class="w-1/2 bg-slate-900 border border-slate-600 rounded px-1 text-xs text-white"><input id="input-team-a-leader" placeholder="감독" class="w-1/2 bg-slate-900 border border-slate-600 rounded px-1 text-xs text-white"></div></div>
                     <div><label class="text-xs text-blue-400 block">Team B 이름/감독</label><div class="flex gap-1"><input id="input-team-b-name" placeholder="팀명" class="w-1/2 bg-slate-900 border border-slate-600 rounded px-1 text-xs text-white"><input id="input-team-b-leader" placeholder="감독" class="w-1/2 bg-slate-900 border border-slate-600 rounded px-1 text-xs text-white"></div></div>
                 </div>
@@ -162,7 +166,8 @@
                 <div id="controls-active" class="hidden space-y-3">
                     <div class="flex gap-2 items-center bg-slate-800 p-2 rounded border border-slate-600">
                         <span class="text-white text-sm font-bold whitespace-nowrap pl-2">₩</span>
-                        <input type="number" id="manual-bid-input" class="w-full bg-transparent text-white font-bold text-xl outline-none text-right pr-2" placeholder="금액 입력">
+                        <!-- [수정] 입찰 금액도 숫자만 입력 가능 -->
+                        <input type="number" id="manual-bid-input" oninput="this.value = this.value.replace(/[^0-9]/g, '');" class="w-full bg-transparent text-white font-bold text-xl outline-none text-right pr-2" placeholder="금액 입력">
                     </div>
                     <button onclick="submitManualBid()" class="w-full bg-yellow-600 hover:bg-yellow-500 text-white py-3 rounded-lg font-bold text-lg shadow transition active:scale-95">
                         🔼 입찰 하기 (Bid)
@@ -230,44 +235,56 @@
             initFirebase();
         };
 
-        // 창 닫을 때 접속 정보 해제 (완벽하진 않지만 시도)
         window.addEventListener('unload', () => {
-            if(myRole === 'team-a' || myRole === 'team-b') {
+            if((myRole === 'team-a' || myRole === 'team-b') && db && docRef) {
                 const field = myRole === 'team-a' ? 'activeCaptains.teamA' : 'activeCaptains.teamB';
-                // sendBeacon은 firestore와 직접 연동이 어려우므로 동기적 실행을 기대할 순 없으나 최소한의 시도
-                if(db) docRef.update({ [field]: false });
+                navigator.sendBeacon(`https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/draft_game/room1?updateMask.fieldPaths=${field}&currentDocument.exists=true`, JSON.stringify({ fields: { [field]: { booleanValue: false } } }));
+                // 참고: sendBeacon으로 firestore 직접 업데이트는 인증/구조상 복잡하므로, 여기선 최선을 다해 시도만 함.
+                // 실질적인 해결책은 '초기화' 버튼 사용 권장.
             }
         });
 
+        // [수정] 트랜잭션을 이용한 강력한 중복 방지 입장
         function joinAs(role) {
             if(role === 'spectator') {
                 finalizeJoin(role);
                 return;
             }
 
-            // 팀장 중복 체크
-            if(!globalState.activeCaptains) {
-                // 데이터가 없을 경우 초기화 후 재시도
-                resetAllDB();
-                setTimeout(() => joinAs(role), 500);
-                return;
-            }
+            db.runTransaction((transaction) => {
+                return transaction.get(docRef).then((sfDoc) => {
+                    if (!sfDoc.exists) { throw "Document does not exist!"; }
+                    const data = sfDoc.data();
+                    
+                    // 데이터 무결성 체크
+                    if (!data.activeCaptains) {
+                        throw "NEED_RESET"; 
+                    }
 
-            const isTeamA = role === 'team-a';
-            const isOccupied = isTeamA ? globalState.activeCaptains.teamA : globalState.activeCaptains.teamB;
+                    const isOccupied = role === 'team-a' ? data.activeCaptains.teamA : data.activeCaptains.teamB;
+                    if (isOccupied) {
+                        throw "ALREADY_TAKEN";
+                    }
 
-            if(isOccupied) {
-                alert("⚠️ 이미 해당 팀장님이 접속 중입니다!\n\n(오류라고 생각되면 '초기화' 버튼을 눌러주세요)");
-                return;
-            }
-
-            // DB에 접속 상태 기록
-            const field = isTeamA ? "activeCaptains.teamA" : "activeCaptains.teamB";
-            docRef.update({ [field]: true })
-                .then(() => {
-                    finalizeJoin(role);
-                })
-                .catch(e => alert("접속 처리 실패: " + e.message));
+                    // 자리 차지하기 (Lock)
+                    const updateData = {};
+                    if (role === 'team-a') updateData['activeCaptains.teamA'] = true;
+                    if (role === 'team-b') updateData['activeCaptains.teamB'] = true;
+                    transaction.update(docRef, updateData);
+                });
+            }).then(() => {
+                // 성공 시 입장 처리
+                finalizeJoin(role);
+            }).catch((err) => {
+                if (err === "ALREADY_TAKEN") {
+                    alert("⚠️ 이미 다른 분이 접속 중입니다!");
+                } else if (err === "NEED_RESET") {
+                    alert("⚠️ 데이터 오류입니다. 관전자 모드로 접속해 '초기화'를 눌러주세요.");
+                } else {
+                    console.error("Transaction failed: ", err);
+                    alert("접속 오류가 발생했습니다: " + err);
+                }
+            });
         }
 
         function finalizeJoin(role) {
@@ -288,7 +305,7 @@
             const loading = document.getElementById('loading-msg');
             if(loading) loading.style.display = 'none';
 
-            // 입장 버튼 상태 표시 (중복 방지용 시각적 표시)
+            // 입장 버튼 상태 표시
             if(data.activeCaptains) {
                 const btnA = document.getElementById('status-team-a');
                 const btnB = document.getElementById('status-team-b');
