@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>실시간 경매 드래프트 (룰렛 기능 추가)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;700&display=swap');
+        body { font-family: 'Noto Sans KR', sans-serif; background-color: #0f172a; color: #e2e8f0; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+        
+        .panel-box { background-color: #1e293b; border: 1px solid #334155; border-radius: 0.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5); }
+        .slot-circle { width: 3rem; height: 3rem; border-radius: 50%; background-color: #334155; border: 2px dashed #64748b; display: flex; align-items: center; justify-content: center; color: #94a3b8; background-size: cover; background-position: center; }
+        .slot-circle.drafted { border: 2px solid #4ade80; box-shadow: 0 0 8px rgba(74, 222, 128, 0.4); }
+        .card-slot { height: 5rem; border-radius: 0.5rem; background-color: #334155; border: 2px solid #475569; background-size: cover; background-position: center; cursor: pointer; transition: all 0.2s; }
+        .card-slot:hover { border-color: #fbbf24; transform: translateY(-2px); }
+
+        /* 팀 전용 제어 */
+        .only-captains { display: none !important; }
+        body.role-team-a .only-captains, body.role-team-b .only-captains { display: block !important; }
+        body.role-spectator .spectator-hide { display: none !important; }
+
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 50; align-items: center; justify-content: center; backdrop-filter: blur(3px); }
+        .modal-overlay.show { display: flex; }
+        
+        /* 채팅 스타일 */
+        .chat-bubble { padding: 6px 10px; border-radius: 8px; margin-bottom: 4px; font-size: 0.85rem; max-width: 90%; word-break: break-all; }
+        .chat-bubble.my { background-color: #4f46e5; margin-left: auto; color: white; }
+        .chat-bubble.other { background-color: #334155; margin-right: auto; color: #cbd5e1; }
+        .chat-badge { font-size: 0.7rem; padding: 2px 4px; border-radius: 4px; margin-right: 4px; font-weight: bold; }
+        .badge-team-a { background-color: #7c3aed; color: white; }
+        .badge-team-b { background-color: #2563eb; color: white; }
+        .badge-spec { background-color: #475569; color: #cbd5e1; }
+
+        /* 룰렛 효과 애니메이션 */
+        @keyframes bounce {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+        .roulette-active { animation: bounce 0.2s infinite; border-color: #fbbf24 !important; box-shadow: 0 0 20px #fbbf24; }
+
+    </style>
+</head>
+<body class="p-4 max-w-7xl mx-auto h-screen flex flex-col">
+
+    <!-- 로그인 모달 -->
+    <div id="login-modal" class="modal-overlay show">
+        <div class="bg-slate-800 border-2 border-purple-500 p-8 rounded-2xl shadow-2xl max-w-md w-full text-center">
+            <h2 class="text-3xl font-bold text-white mb-2">👋 환영합니다!</h2>
+            <p class="text-gray-400 mb-6">역할을 선택해주세요.</p>
+            <div class="space-y-3">
+                <button onclick="joinAs('team-a')" class="w-full py-4 bg-gradient-to-r from-purple-600 to-indigo-600 rounded-xl font-bold text-white text-lg hover:scale-[1.02] transition shadow-lg border border-purple-400/30">🦁 Team A 팀장</button>
+                <button onclick="joinAs('team-b')" class="w-full py-4 bg-gradient-to-r from-blue-600 to-cyan-600 rounded-xl font-bold text-white text-lg hover:scale-[1.02] transition shadow-lg border border-blue-400/30">🐯 Team B 팀장</button>
+                <button onclick="joinAs('spectator')" class="w-full py-4 bg-slate-700 rounded-xl font-bold text-gray-300 text-lg hover:bg-slate-600 transition">🍿 관전자</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 h-full">
+        
+        <!-- [왼쪽] 경매 및 현황 -->
+        <div class="lg:col-span-2 flex flex-col gap-4 h-full overflow-y-auto">
+            <!-- 설정 패널 -->
+            <div class="panel-box p-4 bg-slate-800/50 border-t-4 border-purple-500">
+                <div class="flex justify-between items-center mb-2">
+                    <div class="font-bold text-purple-400">⚙️ 기본 설정</div>
+                    <div class="spectator-hide flex gap-2">
+                        <button onclick="updateSettingsDB()" class="bg-purple-600 px-3 py-1 rounded text-xs text-white font-bold">적용</button>
+                        <button onclick="restartGameDB()" class="bg-yellow-600 px-3 py-1 rounded text-xs text-white font-bold">재시작</button>
+                        <button onclick="resetAllDB()" class="bg-red-600 px-3 py-1 rounded text-xs text-white font-bold">초기화</button>
+                    </div>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <div><label class="text-xs text-gray-400 block">시작 포인트</label><input type="number" id="start-point-input" value="1000" class="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-white text-sm"></div>
+                    <div><label class="text-xs text-purple-400 block">Team A 이름/감독</label><div class="flex gap-1"><input id="input-team-a-name" placeholder="팀명" class="w-1/2 bg-slate-900 border border-slate-600 rounded px-1 text-xs text-white"><input id="input-team-a-leader" placeholder="감독" class="w-1/2 bg-slate-900 border border-slate-600 rounded px-1 text-xs text-white"></div></div>
+                    <div><label class="text-xs text-blue-400 block">Team B 이름/감독</label><div class="flex gap-1"><input id="input-team-b-name" placeholder="팀명" class="w-1/2 bg-slate-900 border border-slate-600 rounded px-1 text-xs text-white"><input id="input-team-b-leader" placeholder="감독" class="w-1/2 bg-slate-900 border border-slate-600 rounded px-1 text-xs text-white"></div></div>
+                </div>
+            </div>
+
+            <!-- 현황판 -->
+            <div class="panel-box bg-[#111827]">
+                <div class="bg-slate-800/80 p-2 border-b border-slate-700 font-bold text-white text-center">팀 현황</div>
+                <div class="divide-y divide-slate-800">
+                    <div class="p-3 flex items-center justify-between bg-slate-900/30"><div><div class="text-lg font-bold text-purple-400" id="display-team-a-name">-</div><div class="text-xs text-gray-500" id="display-team-a-leader">감독: -</div></div><div class="text-2xl font-mono font-bold text-green-400" id="display-team-a-point">1,000</div><div class="flex gap-1" id="slots-team-a"></div></div>
+                    <div class="p-3 flex items-center justify-between bg-slate-900/30"><div><div class="text-lg font-bold text-blue-400" id="display-team-b-name">-</div><div class="text-xs text-gray-500" id="display-team-b-leader">감독: -</div></div><div class="text-2xl font-mono font-bold text-green-400" id="display-team-b-point">1,000</div><div class="flex gap-1" id="slots-team-b"></div></div>
+                </div>
+            </div>
+
+             <!-- 대기 명단 -->
+             <div class="panel-box bg-slate-800 p-3 flex-grow">
+                <div class="flex justify-between items-center mb-2">
+                    <div class="font-bold text-yellow-400">📸 선수 대기실</div>
+                    <div class="spectator-hide flex gap-2">
+                        <button onclick="runRoulette()" class="bg-pink-600 text-white text-xs px-3 py-1.5 rounded font-bold shadow-lg hover:bg-pink-500 transition transform active:scale-95 flex items-center">
+                            <span class="mr-1">🎰</span> 랜덤 뽑기 (Roulette)
+                        </button>
+                        <button onclick="document.getElementById('pool-file-input').click()" class="bg-slate-600 text-white text-xs px-3 py-1.5 rounded shadow">+ 사진 추가</button>
+                    </div>
+                </div>
+                <div id="candidate-pool-container" class="grid grid-cols-6 gap-2 max-h-60 overflow-y-auto p-1"></div>
+            </div>
+        </div>
+
+        <!-- [오른쪽] 채팅 및 로그 -->
+        <div class="lg:col-span-1 flex flex-col gap-4 h-full">
+            <div class="panel-box h-1/3 flex flex-col">
+                <div class="bg-slate-800 p-2 text-center text-xs font-bold text-gray-400 border-b border-slate-700">🔔 시스템 로그</div>
+                <div id="event-log-content" class="flex-grow overflow-y-auto p-2 text-xs text-gray-300 space-y-1 font-mono"><div id="loading-msg" class="text-center mt-4">접속 중...</div></div>
+            </div>
+            <div class="panel-box h-2/3 flex flex-col relative">
+                <div class="bg-slate-800 p-2 text-center text-sm font-bold text-white border-b border-slate-700">💬 실시간 채팅</div>
+                <div id="chat-container" class="flex-grow overflow-y-auto p-3 space-y-2 bg-slate-900/50"></div>
+                <div class="p-2 bg-slate-800 border-t border-slate-700 flex gap-2">
+                    <input type="text" id="chat-input" class="flex-grow bg-slate-900 border border-slate-600 rounded px-3 py-2 text-sm text-white focus:border-purple-500 outline-none" placeholder="메시지 입력..." onkeypress="if(event.key==='Enter') sendChatDB()">
+                    <button onclick="sendChatDB()" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded text-sm font-bold">전송</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- [신규 기능] 룰렛 모달 -->
+    <div id="roulette-modal" class="modal-overlay">
+        <div class="bg-slate-900 border-4 border-pink-500 p-8 rounded-3xl shadow-2xl max-w-md w-full text-center">
+            <h2 class="text-3xl font-extrabold text-pink-400 mb-4 animate-pulse">🎰 추첨 중...</h2>
+            <div class="w-64 h-64 mx-auto rounded-2xl bg-slate-800 border-4 border-slate-600 bg-cover bg-center mb-6 transition-all duration-75" id="roulette-img"></div>
+            <p class="text-white font-bold text-lg">오늘의 주인공은 누구?</p>
+        </div>
+    </div>
+
+    <!-- [경매 모달] - 턴 방식 -->
+    <div id="bidding-modal" class="modal-overlay">
+        <div class="bg-slate-900 border-[3px] border-yellow-500 p-6 rounded-2xl shadow-2xl max-w-sm w-full text-center relative">
+            <h3 class="text-2xl font-extrabold text-yellow-400 mb-2 mt-1 tracking-widest">AUCTION</h3>
+            
+            <!-- 선수 이미지 -->
+            <div class="w-40 h-40 mx-auto rounded-xl bg-slate-800 mb-4 bg-cover bg-center border-4 border-slate-700 shadow-lg" id="bidding-player-img"></div>
+            
+            <!-- 현재 최고 입찰가 표시 -->
+            <div class="bg-slate-800 p-4 rounded-lg mb-4 border border-slate-700 relative overflow-hidden">
+                <div class="text-gray-400 text-xs mb-1 uppercase tracking-wider">Current Bid (Highest)</div>
+                <div id="display-bid-price" class="text-5xl font-mono font-bold text-green-400 drop-shadow-md">0</div>
+                <div id="high-bidder-badge" class="absolute top-2 right-2 px-2 py-1 bg-gray-700 text-[10px] rounded text-white">None</div>
+            </div>
+
+            <!-- 컨트롤러 영역 -->
+            <div class="only-captains space-y-3">
+                <div id="controls-locked" class="hidden p-3 bg-slate-800/50 rounded border border-slate-700">
+                    <p class="text-yellow-400 font-bold animate-pulse">👑 현재 최고 입찰자입니다!</p>
+                    <p class="text-xs text-gray-400 mt-1">상대방의 응답을 기다리는 중...</p>
+                </div>
+
+                <div id="controls-active" class="hidden space-y-3">
+                    <div class="flex gap-2 items-center bg-slate-800 p-2 rounded border border-slate-600">
+                        <span class="text-white text-sm font-bold whitespace-nowrap pl-2">₩</span>
+                        <input type="number" id="manual-bid-input" class="w-full bg-transparent text-white font-bold text-xl outline-none text-right pr-2" placeholder="금액 입력">
+                    </div>
+                    <button onclick="submitManualBid()" class="w-full bg-yellow-600 hover:bg-yellow-500 text-white py-3 rounded-lg font-bold text-lg shadow transition active:scale-95">
+                        🔼 입찰 하기 (Bid)
+                    </button>
+                    
+                    <div id="accept-btns-area" class="grid grid-cols-1 gap-2 mt-2">
+                        <button id="btn-accept-a" onclick="finishBiddingDB('teamA')" class="hidden w-full bg-slate-700 hover:bg-green-600 text-white py-3 rounded font-bold border border-slate-500 transition">
+                            ✅ A팀 낙찰 인정하기 (포기)
+                        </button>
+                        <button id="btn-accept-b" onclick="finishBiddingDB('teamB')" class="hidden w-full bg-slate-700 hover:bg-green-600 text-white py-3 rounded font-bold border border-slate-500 transition">
+                            ✅ B팀 낙찰 인정하기 (포기)
+                        </button>
+                    </div>
+                </div>
+                
+                <button onclick="cancelBiddingDB()" class="w-full border border-slate-600 text-gray-400 hover:text-white py-2 rounded text-xs mt-2">
+                    🚫 경매 취소 / 넘기기
+                </button>
+            </div>
+            
+            <div class="spectator-hide-inverse text-center mt-4 text-gray-500 text-sm">
+                감독님들이 가격을 정하고 있습니다...
+            </div>
+        </div>
+    </div>
+
+    <input type="file" id="pool-file-input" accept="image/*" multiple class="hidden">
+
+    <script>
+        var myRole = 'spectator'; 
+        var globalState = null; 
+        var db = null;
+        var docRef = null;
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyA984OYNlklrVECe4zDAWIxuwEoqD-z-70",
+            authDomain: "mmauction-a9e40.firebaseapp.com",
+            projectId: "mmauction-a9e40",
+            storageBucket: "mmauction-a9e40.firebasestorage.app",
+            messagingSenderId: "501330031400",
+            appId: "1:501330031400:web:5e6ed6eab0ada3350ad61d",
+            measurementId: "G-WH0JED6C60"
+        };
+
+        function initFirebase() {
+            try {
+                if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
+                db = firebase.firestore();
+                docRef = db.collection("draft_game").doc("room1");
+                
+                docRef.onSnapshot((doc) => {
+                    if (doc.exists) {
+                        globalState = doc.data();
+                        renderAll(globalState);
+                    } else {
+                        resetAllDB(); 
+                    }
+                }, (error) => alert("DB 연결 실패: " + error.message));
+            } catch (e) { alert(e.message); }
+        }
+
+        window.onload = () => {
+            createEmptySlots('team-a', 4);
+            createEmptySlots('team-b', 4);
+            initFirebase();
+        };
+
+        function joinAs(role) {
+            myRole = role;
+            document.getElementById('login-modal').classList.remove('show');
+            document.body.className = `role-${role} p-4 max-w-7xl mx-auto h-screen flex flex-col`;
+            
+            let roleName = role === 'team-a' ? 'Team A' : (role === 'team-b' ? 'Team B' : '관전자');
+            if(docRef && globalState) {
+                docRef.update({ chats: firebase.firestore.FieldValue.arrayUnion({
+                    sender: 'System', msg: `${roleName}님이 입장하셨습니다.`, role: 'system', timestamp: Date.now()
+                })});
+            }
+        }
+
+        function renderAll(data) {
+            if(!data) return;
+            const loading = document.getElementById('loading-msg');
+            if(loading) loading.style.display = 'none';
+
+            if(data.settings) {
+                const s = data.settings;
+                document.getElementById('display-team-a-name').textContent = s.teamA.name || "-";
+                document.getElementById('display-team-a-leader').textContent = `감독: ${s.teamA.leader || "-"}`;
+                document.getElementById('display-team-a-point').textContent = s.teamA.points.toLocaleString();
+                document.getElementById('display-team-b-name').textContent = s.teamB.name || "-";
+                document.getElementById('display-team-b-leader').textContent = `감독: ${s.teamB.leader || "-"}`;
+                document.getElementById('display-team-b-point').textContent = s.teamB.points.toLocaleString();
+
+                if(document.activeElement.tagName !== 'INPUT') {
+                    document.getElementById('start-point-input').value = s.startPoint;
+                    document.getElementById('input-team-a-name').value = s.teamA.name;
+                    document.getElementById('input-team-a-leader').value = s.teamA.leader;
+                    document.getElementById('input-team-b-name').value = s.teamB.name;
+                    document.getElementById('input-team-b-leader').value = s.teamB.leader;
+                }
+            }
+
+            if(data.slots) {
+                updateSlots('team-a', data.slots.teamA);
+                updateSlots('team-b', data.slots.teamB);
+            }
+
+            const poolContainer = document.getElementById('candidate-pool-container');
+            poolContainer.innerHTML = '';
+            if(data.pool) data.pool.forEach((url, idx) => {
+                const div = document.createElement('div');
+                div.className = 'card-slot';
+                div.style.backgroundImage = `url('${url}')`;
+                // 룰렛 기능으로 대체되었으므로 직접 클릭 제거 (또는 유지하려면 아래 줄 주석 해제)
+                // if(myRole !== 'spectator') div.onclick = () => startAuctionDB(url, idx);
+                poolContainer.appendChild(div);
+            });
+
+            const modal = document.getElementById('bidding-modal');
+            const activeDiv = document.getElementById('controls-active');
+            const lockedDiv = document.getElementById('controls-locked');
+            const btnAcceptA = document.getElementById('btn-accept-a');
+            const btnAcceptB = document.getElementById('btn-accept-b');
+            const badge = document.getElementById('high-bidder-badge');
+
+            if(data.auction && data.auction.active) {
+                modal.classList.add('show');
+                document.getElementById('bidding-player-img').style.backgroundImage = `url('${data.auction.targetUrl}')`;
+                document.getElementById('display-bid-price').textContent = data.auction.currentBid.toLocaleString();
+                
+                const lastBidder = data.auction.lastBidder;
+
+                if(lastBidder === 'team-a') {
+                    badge.textContent = "Highest: Team A";
+                    badge.className = "absolute top-2 right-2 px-2 py-1 bg-purple-600 text-[10px] rounded text-white font-bold";
+                } else if(lastBidder === 'team-b') {
+                    badge.textContent = "Highest: Team B";
+                    badge.className = "absolute top-2 right-2 px-2 py-1 bg-blue-600 text-[10px] rounded text-white font-bold";
+                } else {
+                    badge.textContent = "No Bids Yet";
+                    badge.className = "absolute top-2 right-2 px-2 py-1 bg-gray-600 text-[10px] rounded text-white";
+                }
+
+                if(myRole !== 'spectator') {
+                    if(lastBidder === myRole) {
+                        activeDiv.classList.add('hidden');
+                        lockedDiv.classList.remove('hidden');
+                    } 
+                    else {
+                        lockedDiv.classList.add('hidden');
+                        activeDiv.classList.remove('hidden');
+                        btnAcceptA.classList.add('hidden');
+                        btnAcceptB.classList.add('hidden');
+                        if(lastBidder === 'team-a' && myRole === 'team-b') btnAcceptA.classList.remove('hidden');
+                        else if(lastBidder === 'team-b' && myRole === 'team-a') btnAcceptB.classList.remove('hidden');
+                    }
+                }
+
+            } else {
+                modal.classList.remove('show');
+                document.getElementById('manual-bid-input').value = '';
+            }
+
+            const logContainer = document.getElementById('event-log-content');
+            let logHtml = '';
+            if(data.logs) data.logs.slice(-20).forEach(log => { logHtml += `<div>${log}</div>`; });
+            logContainer.innerHTML = logHtml; logContainer.scrollTop = logContainer.scrollHeight;
+
+            renderChat(data.chats || []);
+        }
+
+        function renderChat(chats) {
+            const chatContainer = document.getElementById('chat-container');
+            chatContainer.innerHTML = '';
+            chats.slice(-50).forEach(chat => {
+                const div = document.createElement('div');
+                const isMe = (myRole === chat.role);
+                let badgeClass = 'badge-spec'; let badgeText = '관전';
+                if(chat.role === 'team-a') { badgeClass = 'badge-team-a'; badgeText = 'Team A'; }
+                if(chat.role === 'team-b') { badgeClass = 'badge-team-b'; badgeText = 'Team B'; }
+                if(chat.role === 'system') { badgeClass = 'bg-yellow-600 text-white'; badgeText = 'System'; }
+
+                div.className = `chat-bubble ${isMe ? 'my' : 'other'}`;
+                div.innerHTML = `<div class="flex items-center mb-1"><span class="chat-badge ${badgeClass}">${badgeText}</span><span class="text-[10px] opacity-50">${chat.sender}</span></div><div>${chat.msg}</div>`;
+                chatContainer.appendChild(div);
+            });
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function sendChatDB() {
+            const input = document.getElementById('chat-input');
+            const msg = input.value.trim();
+            if(!msg) return;
+            let senderName = '관전자';
+            if(myRole === 'team-a') senderName = document.getElementById('input-team-a-leader').value || 'A팀장';
+            if(myRole === 'team-b') senderName = document.getElementById('input-team-b-leader').value || 'B팀장';
+
+            docRef.update({ chats: firebase.firestore.FieldValue.arrayUnion({
+                sender: senderName, role: myRole, msg: msg, timestamp: Date.now()
+            })}).then(() => { input.value = ''; input.focus(); });
+        }
+
+        function submitManualBid() {
+            if(!globalState.auction.active) return;
+            const input = document.getElementById('manual-bid-input');
+            const bidAmount = parseInt(input.value);
+            const currentBid = globalState.auction.currentBid;
+
+            if(isNaN(bidAmount)) return alert("금액을 입력하세요.");
+            if(bidAmount <= currentBid) return alert(`현재가(${currentBid})보다 높아야 합니다.`);
+
+            docRef.update({
+                "auction.currentBid": bidAmount,
+                "auction.lastBidder": myRole, 
+                logs: firebase.firestore.FieldValue.arrayUnion(`🔥 [입찰] ${bidAmount.toLocaleString()} 포인트 제시됨!`)
+            });
+            
+            let senderName = myRole === 'team-a' ? 'A팀' : 'B팀';
+            sendSystemMessage(`${senderName}이(가) ${bidAmount.toLocaleString()} 포인트로 가격을 올렸습니다!`);
+            input.value = ''; 
+        }
+
+        function sendSystemMessage(text) {
+            docRef.update({ chats: firebase.firestore.FieldValue.arrayUnion({
+                sender: 'System', role: 'system', msg: text, timestamp: Date.now()
+            })});
+        }
+
+        function updateSlots(id, slotData) {
+            const container = document.getElementById(`slots-${id}`);
+            container.innerHTML = '';
+            for(let i=0; i<4; i++) {
+                const div = document.createElement('div');
+                div.className = 'slot-circle';
+                if(slotData[i]) { div.style.backgroundImage = `url('${slotData[i]}')`; div.classList.add('drafted'); }
+                else { div.innerHTML = `<svg class="w-5 h-5 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>`; }
+                container.appendChild(div);
+            }
+        }
+        function createEmptySlots(id, count) { updateSlots(id, []); }
+
+        function updateSettingsDB() {
+            if(myRole === 'spectator') return;
+            const sp = parseInt(document.getElementById('start-point-input').value);
+            docRef.update({
+                "settings.startPoint": sp,
+                "settings.teamA.name": document.getElementById('input-team-a-name').value,
+                "settings.teamA.leader": document.getElementById('input-team-a-leader').value,
+                "settings.teamA.points": sp,
+                "settings.teamB.name": document.getElementById('input-team-b-name').value,
+                "settings.teamB.leader": document.getElementById('input-team-b-leader').value,
+                "settings.teamB.points": sp,
+                logs: firebase.firestore.FieldValue.arrayUnion(`[설정] 변경됨`)
+            });
+        }
+
+        function resetAllDB() {
+            docRef.set({
+                settings: { startPoint: 1000, teamA: { name: "", leader: "", points: 1000 }, teamB: { name: "", leader: "", points: 1000 } },
+                slots: { teamA: [], teamB: [] }, pool: [],
+                auction: { active: false, targetUrl: "", currentBid: 0, targetIdx: -1, lastBidder: null },
+                logs: ["시스템 시작"], chats: []
+            });
+        }
+
+        function restartGameDB() {
+            if(myRole === 'spectator') return;
+            if(!confirm("재시작?")) return;
+            const sp = parseInt(document.getElementById('start-point-input').value);
+            docRef.update({
+                settings: { startPoint: sp, teamA: { name: document.getElementById('input-team-a-name').value, leader: document.getElementById('input-team-a-leader').value, points: sp }, teamB: { name: document.getElementById('input-team-b-name').value, leader: document.getElementById('input-team-b-leader').value, points: sp } },
+                slots: { teamA: [], teamB: [] },
+                auction: { active: false, targetUrl: "", currentBid: 0, targetIdx: -1, lastBidder: null },
+                logs: firebase.firestore.FieldValue.arrayUnion("🔄 재시작됨"), chats: []
+            });
+        }
+
+        document.getElementById('pool-file-input').addEventListener('change', (e) => {
+            if(myRole === 'spectator') return;
+            const files = Array.from(e.target.files);
+            if(files.length === 0) return;
+            files.forEach(file => {
+                const reader = new FileReader();
+                reader.onload = (evt) => docRef.update({ pool: firebase.firestore.FieldValue.arrayUnion(evt.target.result) });
+                reader.readAsDataURL(file);
+            });
+            docRef.update({ logs: firebase.firestore.FieldValue.arrayUnion(`[사진] 추가됨`) });
+            e.target.value = '';
+        });
+
+        function startAuctionDB(url, idx) {
+            if(globalState.auction.active) return alert("경매 진행 중");
+            docRef.update({
+                auction: { active: true, targetUrl: url, currentBid: 0, targetIdx: idx, lastBidder: null },
+                logs: firebase.firestore.FieldValue.arrayUnion(`📢 경매 시작!`)
+            });
+            sendSystemMessage("📢 경매가 시작되었습니다! 입찰해주세요.");
+        }
+
+        function finishBiddingDB(winningTeamKey) {
+            if(!globalState.auction.active) return;
+            const cost = globalState.auction.currentBid;
+            const currentSlots = globalState.slots[winningTeamKey];
+            if(currentSlots.length >= 4) return alert("팀 슬롯이 꽉 찼습니다.");
+
+            const newPool = globalState.pool.filter((_, i) => i !== globalState.auction.targetIdx);
+            const newSettings = { ...globalState.settings };
+            newSettings[winningTeamKey].points -= cost;
+            const tName = newSettings[winningTeamKey].name || (winningTeamKey === 'teamA' ? 'Team A' : 'Team B');
+
+            docRef.update({
+                "auction.active": false,
+                pool: newPool,
+                [`slots.${winningTeamKey}`]: [...currentSlots, globalState.auction.targetUrl],
+                settings: newSettings,
+                logs: firebase.firestore.FieldValue.arrayUnion(`🔨 ${tName} 낙찰! (-${cost})`)
+            });
+            sendSystemMessage(`🎉 ${tName}에서 ${cost}포인트에 낙찰받았습니다!`);
+        }
+
+        function cancelBiddingDB() {
+            docRef.update({ "auction.active": false, logs: firebase.firestore.FieldValue.arrayUnion(`🚫 취소됨`) });
+            sendSystemMessage("🚫 경매가 취소되었습니다.");
+        }
+
+        // ==================================================
+        // 🎰 룰렛 기능 (신규 추가)
+        // ==================================================
+        function runRoulette() {
+            // 권한 체크 (팀장만)
+            if(myRole === 'spectator') return alert("팀장만 실행 가능합니다.");
+            
+            // 데이터 체크
+            if(!globalState.pool || globalState.pool.length === 0) return alert("대기 명단에 사진이 없습니다.");
+            
+            // 중복 실행 방지
+            if(globalState.auction.active) return alert("이미 경매가 진행 중입니다.");
+
+            // 1. 룰렛 모달 띄우기
+            const rouletteModal = document.getElementById('roulette-modal');
+            const rouletteImg = document.getElementById('roulette-img');
+            rouletteModal.classList.add('show');
+
+            // 2. 이미지 뺑뺑이 (애니메이션)
+            let counter = 0;
+            const maxIterations = 30; // 30번 바뀜
+            const pool = globalState.pool;
+            
+            const interval = setInterval(() => {
+                // 랜덤으로 이미지 보여주기
+                const r = Math.floor(Math.random() * pool.length);
+                rouletteImg.style.backgroundImage = `url('${pool[r]}')`;
+                rouletteImg.classList.add('roulette-active'); // 효과
+                setTimeout(()=>rouletteImg.classList.remove('roulette-active'), 50);
+
+                counter++;
+                
+                // 3. 멈춤
+                if(counter >= maxIterations) {
+                    clearInterval(interval);
+                    
+                    // 최종 당첨자 선정 (랜덤)
+                    const finalIdx = Math.floor(Math.random() * pool.length);
+                    const finalUrl = pool[finalIdx];
+                    rouletteImg.style.backgroundImage = `url('${finalUrl}')`;
+                    rouletteImg.style.borderColor = '#fbbf24'; // 금색 테두리
+                    
+                    // 1초 뒤에 실제 경매 시작
+                    setTimeout(() => {
+                        rouletteModal.classList.remove('show');
+                        rouletteImg.style.borderColor = '#475569'; // 원복
+                        startAuctionDB(finalUrl, finalIdx);
+                    }, 1000);
+                }
+            }, 100); // 0.1초마다 바뀜
+        }
+    </script>
+</body>
+</html>
